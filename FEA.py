@@ -144,6 +144,104 @@ def GeometricNonlinearTL(mesh, material, discretization, DirichletBC, ExternalFo
                 
     return U_history
 
+def GeometricNonlinearUL(mesh, material, discretization, DirichletBC, ExternalForce, steps=100):
+    nodes_updated = mesh.nodes.copy()
+    numN_element = mesh.elements.shape[1]
+    for outer_iter in np.arange(1,steps+1):
+        R = ExternalForce * outer_iter / steps
+        for inner_iter in np.arange(1,101):
+            row_idx, col_idx, data_val_K, data_val_M = [], [], [], []
+            F = np.zeros((mesh.total_dofs, 1))
+            for elem_node_indices in mesh.elements:
+                phi = np.array(elem_node_indices)
+                
+                Ke = np.zeros((2 * numN_element, 2 * numN_element))
+                Fe = np.zeros((2 * numN_element, 1))
+
+                # ----- Stiffness Matrix Integration -----
+                for j, r in enumerate(discretization.GQ_K_x):
+                    for k, s in enumerate(discretization.GQ_K_x):
+
+                        J = discretization.dhdR(r, s) @ nodes_updated[elem_node_indices, :2]
+                        HrHs = discretization.dhdR(r, s)    # Shape: (2, 2 * numN_element)
+                        HxHy = np.linalg.solve(J, HrHs)     # Shape: (2, 2 * numN_element)
+                        Hx, Hy = HxHy[0], HxHy[1]           # Extract rows
+                        Hx = Hx.reshape(1, -1)
+                        Hy = Hy.reshape(1, -1)
+
+                        # Almansi strain and Cauchy stress
+                        U = nodes_updated[:,:2].flatten(order='F').reshape(-1,1) - mesh.nodes[:, :2].flatten(order='F').reshape(-1,1)
+                        epsA11 = Hx @ U[phi] - 0.5 * (Hx @ U[phi])**2 - 0.5 * (Hx @ U[phi + mesh.ndofs_per_dimension])**2
+                        epsA22 = Hy @ U[phi + mesh.ndofs_per_dimension] - 0.5 * (Hy @ U[phi])**2 - 0.5 * (Hy @ U[phi + mesh.ndofs_per_dimension])**2
+                        epsA12 = 0.5 * ( Hy @ U[phi] 
+                                   + Hx @ U[phi + mesh.ndofs_per_dimension] 
+                                   - Hx @ U[phi] * Hy @ U[phi] 
+                                   - Hx @ U[phi + mesh.ndofs_per_dimension] * Hy @ U[phi + mesh.ndofs_per_dimension])
+                        tau = material.C @ np.concatenate([epsA11, epsA22, 2*epsA12]) # No initial-to-current transformation for C given small strain assumption (see )
+
+                        # K_linear
+                        B_L = np.block([
+                            [Hx, np.zeros((1, numN_element))],
+                            [np.zeros((1, numN_element)), Hy],
+                            [Hy, Hx]
+                        ])
+                        K_L = B_L.T @ material.C @ B_L
+
+                        # K_nonlinear
+                        K_NL11 = np.block([
+                            [Hx.T * tau[0] @ Hx, np.zeros((numN_element, numN_element))],
+                            [np.zeros((numN_element, numN_element)), Hx.T * tau[0] @ Hx]
+                            ])
+                        K_NL22 = np.block([
+                            [Hy.T * tau[1] @ Hy, np.zeros((numN_element, numN_element))],
+                            [np.zeros((numN_element, numN_element)), Hy.T * tau[1] @ Hy]
+                            ])
+                        K_NL12 = np.block([
+                            [Hy.T * tau[2] @ Hx + Hx.T * tau[2] @ Hy, np.zeros((numN_element, numN_element))],
+                            [np.zeros((numN_element, numN_element)), Hy.T * tau[2] @ Hx + Hx.T * tau[2] @ Hy]
+                        ])
+                        K_NL = K_NL11 + K_NL22 + K_NL12
+
+                        Ke += (K_L + K_NL) * np.linalg.det(J) * discretization.GQ_K_w[j] * discretization.GQ_K_w[k]
+                        Fe += B_L.T @ tau * np.linalg.det(J) * discretization.GQ_K_w[j] * discretization.GQ_K_w[k]
+
+                # ----- Collect Stiffness Matrices -----
+                for i in range(2 * numN_element):
+                    for j in range(2 * numN_element):
+                        row = phi[i] if i < numN_element else phi[i - numN_element] + mesh.ndofs_per_dimension
+                        col = phi[j] if j < numN_element else phi[j - numN_element] + mesh.ndofs_per_dimension
+                        row_idx.append(row)
+                        col_idx.append(col)
+                        data_val_K.append(Ke[i, j])
+
+                F[np.concatenate([phi, phi + mesh.ndofs_per_dimension])] += Fe
+            
+            # ----- Assemble Global Stiffness Matrix -----
+            K = coo_matrix((data_val_K, (row_idx, col_idx)), shape=(mesh.total_dofs, mesh.total_dofs)).tocsr()
+            K_ff = K[DirichletBC.free_dofs[:, None], DirichletBC.free_dofs]  # shape: (n_free, n_free)
+            # Residual vector for free DOFs
+            residual = R[DirichletBC.free_dofs] - F[DirichletBC.free_dofs]   # shape: (n_free,)
+            # Solve for displacement increment
+            del_U = spsolve(K_ff, residual).reshape(-1, 1)
+            U = np.zeros((mesh.total_dofs, 1))
+            U[DirichletBC.free_dofs] = del_U
+            nodes_updated[:,:2] += U.reshape((-1, 2), order='F')
+            # Save condition number for each inner iteration
+            if outer_iter == 1 and inner_iter == 1:
+                cond_Kff_arr = []
+            cond_Kff = np.linalg.cond(K_ff.toarray())
+            cond_Kff_arr.append(cond_Kff)
+            #print(f"Condition number of K_ff: {cond_Kff:.3e}")
+            if np.linalg.norm(residual) < 1e-6:
+                print(f"Converged at the outer iteration {outer_iter:>3} with {inner_iter:>3} inner iterations.")
+                U_history = np.concatenate([U_history, nodes_updated[:,:2].reshape(-1,1,order='F')-mesh.nodes[:,:2].reshape(-1,1,order='F')],axis = 1) if outer_iter > 1 else U
+                break
+            elif inner_iter == 100:
+                print(f"Error: Did not converge within the maximum number of inner iterations 100 for the outer iteration {outer_iter}.")
+                sys.exit(1)
+                
+    return U_history
+
 def DrawMesh2D(mesh, U=np.zeros((0,0)), scale=1, title="Mesh"):
     plt.figure()
     nodes_deformed = mesh.nodes[:,:2] + scale * np.vstack([U[:mesh.ndofs_per_dimension], U[mesh.ndofs_per_dimension:]]).T if U.size else mesh.nodes
